@@ -61,7 +61,7 @@ sp2 --help
 sp2 --dry-run restart api
 ```
 
-最后一条命令应输出 `supervisorctl restart api`，只显示转换结果，不会实际重启进程。
+最后一条命令应输出 `supervisorctl restart 'api:*'`，只显示转换结果，不会实际重启进程。
 
 为使新终端也能找到 `sp2`，将以下配置添加到 shell 配置文件（已存在时无需重复添加）：
 
@@ -174,7 +174,16 @@ Supervisor 按组移除，因此一行和一个 ID 对应整个进程组；同�
 
 ID 自动保存在当前用户的 `~/.local/sp2/ids.json`，macOS 与 Ubuntu 使用相同的相对主目录路径；例如 Linux root 用户为 `/root/.local/sp2/ids.json`。无需数据库或手动维护。不同 Supervisor 连接分别保存映射，同名组恢复后沿用原 ID，旧 ID 不会分配给其他名称；写入使用文件锁和原子替换。文件损坏时会报错并保留原文件。
 
-`sp2 --sudo` 仍使用当前用户的 ID 文件；`sudo sp2` 则使用 sudo 后用户的主目录。查看列表和按 ID 删除时，请使用同一用户及相同连接。ID 目前用于 `del/delete`；其他命令继续接受 Supervisor 名称。
+`sp2 --sudo` 仍使用当前用户的 ID 文件；`sudo sp2` 则使用 sudo 后用户的主目录。查看列表和按 ID 操作时，请使用同一用户及相同连接。`start/stop/restart` 和 `del/delete` 均支持表格 ID，也接受名称；纯数字组名用 `name:123`。
+
+```bash
+sp2 ls
+sp2 start 0
+sp2 stop 0
+sp2 restart 0 worker
+```
+
+ID 和组名操作作用于整个组，自动转为 Supervisor 的 `组:*`，因此支持 `cogvideo-worker:cogvideo-worker_00` 这样的进程池。若只操作组内某一个进程，使用完整名称，例如 `sp2 restart cogvideo-worker:cogvideo-worker_00`。`all` 沿用原生的全部进程含义。`--dry-run start/stop/restart ID` 会读取现有 ID 和状态以打印转换结果，不分配新 ID，也不启停进程。未知或已移除的 ID 会在执行前报错。
 
 ### 按 ID 或名称软删除
 
@@ -213,7 +222,7 @@ sp2 ps
 | `ls/list/ps/status [目标...]` | `status [目标...]`；`status` 始终使用原生输出 |
 | `del/delete ID或组名...` | 配置加 `.sp2.disabled` 后缀，再 `update 组名...` |
 | `describe/show/info 目标...` | `status 目标...` |
-| `start/stop/restart 目标...` | 同名命令 |
+| `start/stop/restart ID或名称...` | 同名命令；ID、组名转为 `组:*`，完整进程名和 `all` 原样传递 |
 | `pid [目标...]` | `pid 目标...`，省略目标时为 `pid all` |
 | `logs 进程` | `tail -f 进程 stdout` |
 | `logs 进程 --err` | `tail -f 进程 stderr` |
@@ -224,7 +233,7 @@ sp2 ps
 | `sendSignal SIGUSR1 目标...` | `signal SIGUSR1 目标...` |
 | `ctl 原生命令 参数...` | 原样转交 |
 
-除 `del/delete` 外，目标使用 Supervisor 进程名、`组:进程`、带引号的 `'组:*'`，或原生命令支持的 `all`。`logs` 只接受单个进程。这些命令中的数字进程名仍是名称，不会转换成 ID。
+`start/stop/restart` 和 `del/delete` 的纯数字目标按表格 ID 解释，数字组名使用 `name:名称`。其他命令继续使用 Supervisor 名称，数字参数也沿用原生命名语义。`logs` 只接受单个进程；支持原生目标的命令可使用 `组:进程`、带引号的 `'组:*'` 或 `all`。
 
 ## 行为约定
 

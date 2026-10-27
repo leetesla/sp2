@@ -23,6 +23,7 @@ import unicodedata
 DISABLED_SUFFIX = ".sp2.disabled"
 LIST_COMMANDS = {"list", "ls", "ps"}
 DELETE_COMMANDS = {"del", "delete"}
+LIFECYCLE_COMMANDS = {"start", "stop", "restart"}
 
 
 class Sp2Error(Exception):
@@ -39,7 +40,7 @@ def parser():
                      help="Supervisor 主配置文件（也可设置 SP2_CONFIG）")
     cli.add_argument("-s", "--serverurl", help="Supervisor HTTP 或 Unix socket URL")
     cli.add_argument("--sudo", action="store_true", help="通过 sudo 调用 supervisorctl；del 时也用于配置改名")
-    cli.add_argument("--dry-run", action="store_true", help="仅打印操作计划；del 会读取状态和配置以解析目标")
+    cli.add_argument("--dry-run", action="store_true", help="仅打印操作计划；ID 操作会读取状态，del 也会读取配置")
     commands = cli.add_subparsers(dest="command", metavar="命令")
 
     commands.add_parser("help", help="显示命令使用帮助")
@@ -55,7 +56,7 @@ def parser():
     for name, help_text in [("start", "启动已注册进程"), ("stop", "停止进程"),
                             ("restart", "重启进程，不重新读取配置")]:
         action = commands.add_parser(name, help=help_text)
-        action.add_argument("names", nargs="+", help="进程名、'group:*' 或 all；不是脚本路径或 PM2 ID")
+        action.add_argument("names", nargs="+", help="表格 ID、组名、group:process 或 all；数字组名用 name:名称")
     pid = commands.add_parser("pid", help="查看进程 PID；省略目标时查看全部子进程")
     pid.add_argument("names", nargs="*")
     flush = commands.add_parser("flush", help="清空指定或全部进程日志")
@@ -317,18 +318,50 @@ def list_groups(args):
     return code
 
 
+def resolve_group_name(argument, registry):
+    if argument.startswith("name:"):
+        if not argument[5:]:
+            raise Sp2Error("name: 后需要组名")
+        return argument[5:]
+    if not argument.isdecimal():
+        return argument
+    ids = {str(value): name for name, value in registry["groups"].items()}
+    name = ids.get(str(int(argument)))
+    if name is None:
+        raise Sp2Error("未知 ID {}；请先用相同用户和连接选项执行 sp2 ls".format(argument))
+    return name
+
+
+def resolve_lifecycle_targets(args):
+    resolved = {}
+    if any(name.isdecimal() for name in args.names):
+        groups, _ = read_status(args)
+        with id_registry(args, create=False) as registry:
+            for argument in args.names:
+                if argument.isdecimal():
+                    name = resolve_group_name(argument, registry)
+                    if name not in groups:
+                        raise Sp2Error("ID {} 对应的进程组 {} 已不在 Supervisor 中；请先恢复配置并 reload".format(
+                            argument, name))
+                    resolved[argument] = name + ":*"
+    targets = []
+    for argument in args.names:
+        if argument in resolved:
+            target = resolved[argument]
+        elif argument == "all":
+            target = "all"
+        else:
+            name = resolve_group_name(argument, {"groups": {}})
+            target = name if ":" in name else name + ":*"
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+
 def resolve_delete_targets(arguments, groups, registry):
     targets = []
-    ids = {str(value): name for name, value in registry["groups"].items()}
     for argument in arguments:
-        if argument.startswith("name:"):
-            name = argument[5:]
-        elif argument.isdecimal():
-            name = ids.get(str(int(argument)))
-            if name is None:
-                raise Sp2Error("未知 ID {}；请先用相同用户和连接选项执行 sp2 ls".format(argument))
-        else:
-            name = argument
+        name = resolve_group_name(argument, registry)
         if name not in groups:
             raise Sp2Error("进程组不存在：{}；请使用 ls 中的 ID 或 name".format(name))
         if name not in targets:
@@ -464,6 +497,8 @@ def main():
             return delete_groups(args)
         if args.command in LIST_COMMANDS and not args.names and not args.dry_run:
             return list_groups(args)
+        if args.command in LIFECYCLE_COMMANDS:
+            args.names = resolve_lifecycle_targets(args)
         return run_translated(args, cli)
     except Sp2Error as error:
         print("sp2: {}".format(error), file=sys.stderr)

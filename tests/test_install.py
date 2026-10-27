@@ -74,7 +74,7 @@ printf '#!/bin/bash\\nexit 0\\n' > "$MOCK_ROOT/bin/supervisord"
         result = subprocess.run([str(path), "--dry-run", "restart", "api"],
                                 env=self.env, text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "supervisorctl restart api")
+        self.assertEqual(shlex.split(result.stdout), ["supervisorctl", "restart", "api:*"])
 
     def test_macos_default_install_and_repeat_without_package_changes(self):
         for _ in range(2):

@@ -94,6 +94,10 @@ class TranslationTests(unittest.TestCase):
     def test_pid_defaults_to_children_and_reload_never_restarts_daemon(self):
         for args, expected in [(("ls",), ["status"]), (("pid",), ["pid", "all"]),
                                (("reload", "worker"), ["update", "worker"]),
+                               (("start", "api"), ["start", "api:*"]),
+                               (("stop", "all"), ["stop", "all"]),
+                               (("restart", "name:123"), ["restart", "123:*"]),
+                               (("stop", "batch:batch_00"), ["stop", "batch:batch_00"]),
                                (("sendSignal", "SIGUSR1", "api"), ["signal", "SIGUSR1", "api"])]:
             with self.subTest(args=args):
                 result = self.run_sp2(*args)
@@ -209,6 +213,50 @@ class SupervisorTests(unittest.TestCase):
         disabled.rename(api)
         self.assert_ok("reload", "api")
         self.assertEqual(self.group_ids()["api"], original["api"])
+
+    def test_start_stop_restart_by_id_control_every_process_in_the_group(self):
+        ids = self.group_ids()
+        target = str(ids["batch"])
+        unrelated_pid = self.assert_ok("pid", "api").strip()
+        self.assert_ok("stop", target)
+        stopped = self.run_sp2("status", "batch:*")
+        self.assertEqual(stopped.stdout.count("STOPPED"), 2)
+        self.assert_ok("start", target)
+        self.assertEqual(self.assert_ok("status", "batch:*").count("RUNNING"), 2)
+        names = ["batch:batch_00", "batch:batch_01"]
+        previous = [self.assert_ok("pid", name).strip() for name in names]
+        self.assert_ok("restart", target)
+        current = [self.assert_ok("pid", name).strip() for name in names]
+        self.assertEqual(len(current), 2)
+        self.assertTrue(all(before != after for before, after in zip(previous, current)))
+        self.assertEqual(self.assert_ok("pid", "api").strip(), unrelated_pid)
+
+    def test_lifecycle_id_preview_and_unknown_ids_do_not_mutate_processes(self):
+        ids = self.group_ids()
+        registry = self.root / "home/.local/sp2/ids.json"
+        original_registry = registry.read_bytes()
+        original_pid = self.assert_ok("pid", "api").strip()
+        preview = self.assert_ok("--dry-run", "restart", str(ids["batch"]))
+        self.assertEqual(shlex.split(preview)[-2:], ["restart", "batch:*"])
+        self.assertEqual(registry.read_bytes(), original_registry)
+        result = self.run_sp2("stop", "api", "999999")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未知 ID", result.stderr)
+        self.assertEqual(self.assert_ok("pid", "api").strip(), original_pid)
+        self.assertIn("RUNNING", self.assert_ok("status", "api"))
+        self.assert_ok("del", str(ids["worker"]))
+        result = self.run_sp2("start", str(ids["worker"]))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("已不在 Supervisor 中", result.stderr)
+
+    def test_lifecycle_accepts_mixed_ids_names_and_individual_process_names(self):
+        ids = self.group_ids()
+        self.assert_ok("stop", str(ids["batch"]), "api")
+        self.assertNotEqual(self.run_sp2("status", "api").returncode, 0)
+        self.assert_ok("start", "batch", str(ids["api"]))
+        self.assert_ok("stop", "batch:batch_00")
+        self.assertIn("RUNNING", self.assert_ok("status", "batch:batch_01"))
+        self.assert_ok("start", "batch:batch_00")
 
     def test_soft_delete_overwrites_backup_and_removes_stopped_group_by_name(self):
         self.assert_ok("stop", "batch:*")
@@ -413,6 +461,10 @@ class SupervisorTests(unittest.TestCase):
         source.write_text(source.read_text().replace("[program:api]", "[program:123]"))
         self.assert_ok("reload")
         self.group_ids()
+        self.assert_ok("stop", "name:123")
+        self.assertIn("STOPPED", self.run_sp2("status", "123").stdout)
+        self.assert_ok("start", "name:123")
+        self.assertIn("RUNNING", self.assert_ok("status", "123"))
         self.assert_ok("del", "name:123", "batch", "worker")
         self.assertEqual(self.group_ids(), {})
 
