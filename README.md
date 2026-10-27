@@ -1,6 +1,6 @@
 # sp2：Supervisor 的类 PM2 命令入口
 
-`sp2` 只负责命令转换，调用本机现有 `supervisorctl`。需要 Python 3.8+ 和 Supervisor；进程定义、重启策略、日志和开机启动继续由现有 Supervisor 管理。
+`sp2` 为本机现有 Supervisor 提供类 PM2 命令、带稳定 ID 的进程组表格，以及按 ID 或名称软删除配置的操作。需要 Python 3.8+ 和 Supervisor；进程定义、重启策略、日志和开机启动继续由 Supervisor 管理。
 
 ## 项目缘起
 
@@ -93,7 +93,7 @@ sp2 --sudo ls
 
 将对应的 `export SP2_CONFIG=...` 行加入 `~/.zshrc` 或 `~/.bashrc`，即可在新终端继续使用。已有自定义 Supervisor 配置时，请使用自己的配置路径，并按原有方式管理服务。Ubuntu 如需开机启动，可执行 `sudo systemctl enable supervisor`。
 
-`sp2 ls` 显示的是 Supervisor 中已配置的进程；首次安装且没有进程配置时，列表可能为空。后文示例中的 `api`、`worker` 等名称需要替换为自己的 Supervisor 进程名。
+`sp2 ls` / `sp2 ps` 按进程组显示表格并分配稳定 ID；首次安装且没有进程配置时，表格只有表头。后文示例中的 `api`、`worker` 等名称需要替换为自己的 Supervisor 进程或组名。
 
 ### 自定义安装与更新
 
@@ -155,12 +155,61 @@ sp2 --dry-run restart 'worker:*'
 
 `SP2_SUPERVISORCTL` 可指定 supervisorctl 可执行文件的完整路径，不接受额外参数。
 
+### 表格与稳定 ID
+
+`sp2 ps`、`sp2 ls` 和 `sp2 list` 无目标参数时，以表格显示组 ID、名称、状态、进程数、PID、内存占用和运行时间。例如：
+
+```text
+┌────┬─────────────────┬─────────┬───────────┬────────┬──────────┬─────────┐
+│ id │ name            │ status  │ processes │ pid    │ memory   │ uptime  │
+├────┼─────────────────┼─────────┼───────────┼────────┼──────────┼─────────┤
+│ 0  │ cogvideo-worker │ RUNNING │ 1         │ 119185 │ 15.0 MiB │ 0:20:44 │
+│ 1  │ laravel-worker  │ STOPPED │ 1         │ -      │ 0 B      │ -       │
+└────┴─────────────────┴─────────┴───────────┴────────┴──────────┴─────────┘
+```
+
+Supervisor 按组移除，因此一行和一个 ID 对应整个进程组；同组有多个进程时会显示数量和全部 PID。`sp2 status`、`sp2 ls 目标...` 和 `sp2 ctl status` 保留原生逐进程状态输出。
+
+`memory` 通过 macOS / Ubuntu 自带的 `ps` 读取各 PID 的 [RSS](https://www.man7.org/linux/man-pages/man1/ps.1.html)，按组汇总并显示 KiB / MiB / GiB。统计范围是 Supervisor 直接管理的进程；共享页可能重复计入，不包含未单独托管的子进程。已停止的组显示 `0 B`；远程连接、权限不足或进程在采样前退出时显示 `-`，内存采样失败不会影响列表使用。本机内存采样要求能识别对应的 Unix socket 连接。
+
+ID 自动保存在当前用户的 `~/.local/sp2/ids.json`，macOS 与 Ubuntu 使用相同的相对主目录路径；例如 Linux root 用户为 `/root/.local/sp2/ids.json`。无需数据库或手动维护。不同 Supervisor 连接分别保存映射，同名组恢复后沿用原 ID，旧 ID 不会分配给其他名称；写入使用文件锁和原子替换。文件损坏时会报错并保留原文件。
+
+`sp2 --sudo` 仍使用当前用户的 ID 文件；`sudo sp2` 则使用 sudo 后用户的主目录。查看列表和按 ID 删除时，请使用同一用户及相同连接。ID 目前用于 `del/delete`；其他命令继续接受 Supervisor 名称。
+
+### 按 ID 或名称软删除
+
+直接查看 ID 并删除即可；`del` 沿用 supervisorctl 的配置查找顺序，自动识别 Homebrew 安装前缀、当前目录及 Ubuntu 的标准配置位置。自定义位置也可通过 `-c` 或 `SP2_CONFIG` 指定：
+
+```bash
+sp2 ps
+sp2 --dry-run del laravel-worker  # 查看配置改名和组更新计划
+sp2 del laravel-worker           # 按组名删除
+# 或：sp2 del 1                  # 按上方列表中的实际 ID 删除
+# 多组：sp2 del laravel-worker veovideo-worker
+```
+
+以 `laravel-worker.conf` 为例，`del` 将配置改名为 `laravel-worker.conf.sp2.disabled`，再通过 Supervisor 的 `update 组名` 停止并移除该组。同名 `.sp2.disabled` 副本会被直接覆盖，只保留本次删除的配置。代码、日志和 ID 映射继续保留；正常 reload 或 Supervisor 重启后，该配置也不会重新加载。`delete` 是 `del` 的别名。
+
+名称使用表格中的组名，即原生 `组:进程` 中冒号前的部分。纯数字参数按 ID 解释；数字组名用 `sp2 del name:123`。所有目标都会先检查，再开始修改配置。软删除支持已找到的主配置对应的本机 Unix socket；配置须位于主配置 include 引入的独立文件中。若文件还包含未选择的组或其他配置，会要求先拆分；若 include 使用 `*` 等仍会匹配禁用副本的规则，会要求先收窄为 `*.conf` 等规则。需要权限时使用 `sp2 --sudo del 组名`；若连配置都无法读取，请以有权限的用户执行。
+
+恢复时，将 `.sp2.disabled` 文件改回原名，再应用配置；先确认原名位置没有新的配置：
+
+```bash
+mv -i /etc/supervisor/conf.d/laravel-worker.conf.sp2.disabled /etc/supervisor/conf.d/laravel-worker.conf
+sp2 reload laravel-worker
+sp2 ps
+```
+
+配置文件位置以实际输出为准；macOS 同样操作对应 Homebrew 配置目录中的文件。恢复后是否自动启动由原配置的 `autostart` 决定。
+
 ## 命令对应关系
 
 | sp2 | supervisorctl |
 | --- | --- |
 | 无参数、`help`、`--help` | 显示 sp2 使用帮助 |
-| `ls`、`list`、`status [目标...]` | `status [目标...]` |
+| `ls`、`list`、`ps`（无目标） | `status`，按组显示表格并维护 ID |
+| `ls/list/ps/status [目标...]` | `status [目标...]`；`status` 始终使用原生输出 |
+| `del/delete ID或组名...` | 配置加 `.sp2.disabled` 后缀，再 `update 组名...` |
 | `describe/show/info 目标...` | `status 目标...` |
 | `start/stop/restart 目标...` | 同名命令 |
 | `pid [目标...]` | `pid 目标...`，省略目标时为 `pid all` |
@@ -173,16 +222,16 @@ sp2 --dry-run restart 'worker:*'
 | `sendSignal SIGUSR1 目标...` | `signal SIGUSR1 目标...` |
 | `ctl 原生命令 参数...` | 原样转交 |
 
-目标使用 Supervisor 进程名、`组:进程`、带引号的 `'组:*'`，或原生命令支持的 `all`。`logs` 只接受单个进程。Supervisor 的数字进程名仍是名称，不会转换成 PM2 ID。
+除 `del/delete` 外，目标使用 Supervisor 进程名、`组:进程`、带引号的 `'组:*'`，或原生命令支持的 `all`。`logs` 只接受单个进程。这些命令中的数字进程名仍是名称，不会转换成 ID。
 
 ## 行为约定
 
-- 输出和退出码沿用 Supervisor：`status` 中存在停止的进程可能返回非零，连接失败或启停失败也会返回非零。
+- `ls/ps/list` 无目标时格式化为组表格，状态退出码仍沿用 Supervisor：存在停止的进程可能返回非零。其他原生命令沿用其输出和退出码；软删除遇到错误返回非零。
 - `start api` 启动已注册的 api；首次添加进程仍需编写 Supervisor 配置并执行 `sp2 reload 组名`。
 - `restart` 不读取配置。`reload` 是应用 Supervisor 配置变更，仅重启受影响的组；代码变了但配置没变时不会因此重启。它不是 PM2 cluster 的零停机 reload，也不会调用重启整个 daemon 的 `supervisorctl reload`。
 - 日志默认跟随 stdout；`--err` 切换 stderr。若现有配置设置 `redirect_stderr=true`，错误输出也会进入 stdout。`--bytes` 是字节数，不提供含义不同的 `--lines` 参数。
-- 不提供 PM2 的 `delete/save/resurrect/startup/scale`。原生 `remove` 只移除运行时注册，不能当作永久删除磁盘配置；需要时明确使用 `sp2 ctl remove 组名`。
-- `sp2` 命令本身不自动启动 Supervisor、安装依赖、修改配置或申请 sudo；只有显式 `--sudo` 才调用 sudo。安装脚本的依赖安装行为见上文。`flush` 会清空目标日志。
+- `del/delete` 软删除会覆盖已有同名禁用副本，并停止目标组中的全部进程。原生 `sp2 ctl remove 组名` 只移除运行时注册，配置仍会被重新加载。不提供 PM2 的 `save/resurrect/startup/scale`。
+- `sp2` 命令本身不自动启动 Supervisor 或安装依赖；列表操作维护本地 ID 文件，`del/delete` 修改配置文件名，`flush` 清空目标日志。只有显式 `--sudo` 才调用 sudo。安装脚本的依赖安装行为见上文。
 
 ## 验证
 

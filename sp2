@@ -1,11 +1,32 @@
 #!/usr/bin/env python3
-"""PM2-style commands translated to the existing supervisorctl installation."""
+"""PM2-style commands and stable group IDs for an existing Supervisor."""
 
 import argparse
+import configparser
+from contextlib import contextmanager
+import fcntl
+import fnmatch
+import glob
+import hashlib
+import json
 import os
+from pathlib import Path
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+import unicodedata
+
+
+DISABLED_SUFFIX = ".sp2.disabled"
+LIST_COMMANDS = {"list", "ls", "ps"}
+DELETE_COMMANDS = {"del", "delete"}
+
+
+class Sp2Error(Exception):
+    pass
 
 
 def parser():
@@ -17,13 +38,18 @@ def parser():
     cli.add_argument("-c", "--config", "--configuration", default=os.environ.get("SP2_CONFIG"),
                      help="Supervisor 主配置文件（也可设置 SP2_CONFIG）")
     cli.add_argument("-s", "--serverurl", help="Supervisor HTTP 或 Unix socket URL")
-    cli.add_argument("--sudo", action="store_true", help="通过 sudo 调用 supervisorctl")
-    cli.add_argument("--dry-run", action="store_true", help="仅打印转换后的命令")
+    cli.add_argument("--sudo", action="store_true", help="通过 sudo 调用 supervisorctl；del 时也用于配置改名")
+    cli.add_argument("--dry-run", action="store_true", help="仅打印操作计划；del 会读取状态和配置以解析目标")
     commands = cli.add_subparsers(dest="command", metavar="命令")
 
     commands.add_parser("help", help="显示命令使用帮助")
-    status = commands.add_parser("list", aliases=["ls", "status"], help="查看全部或指定进程状态")
+    status = commands.add_parser("list", aliases=["ls", "ps", "status"],
+                                 help="ls/ps 以表格显示进程组与稳定 ID；status 显示原生状态")
     status.add_argument("names", nargs="*", help="进程名、group:process、'group:*' 或 all")
+    delete = commands.add_parser("del", aliases=["delete"],
+                                 help="按 ID 或组名软删除：配置加 .sp2.disabled 后缀，并停止、移除组")
+    delete.add_argument("names", nargs="+", metavar="ID或组名",
+                        help="ls/ps 中的组 ID 或组名；数字组名用 name:名称；自动查找 Supervisor 配置")
     describe = commands.add_parser("describe", aliases=["show", "info"], help="查看指定进程状态")
     describe.add_argument("names", nargs="+")
     for name, help_text in [("start", "启动已注册进程"), ("stop", "停止进程"),
@@ -57,7 +83,7 @@ def parser():
 
 def translate(args, cli):
     action = args.command
-    if action in {"list", "ls", "status", "describe", "show", "info"}:
+    if action in LIST_COMMANDS | {"status", "describe", "show", "info"}:
         return ["status", *getattr(args, "names", [])]
     if action in {"start", "stop", "restart"}:
         return [action, *args.names]
@@ -86,39 +112,375 @@ def translate(args, cli):
     return args.arguments
 
 
+def ctl_command(args, *action):
+    command = [os.environ.get("SP2_SUPERVISORCTL", "supervisorctl")]
+    if args.config:
+        command.extend(["-c", args.config])
+    if args.serverurl:
+        command.extend(["-s", args.serverurl])
+    if args.sudo:
+        command.insert(0, "sudo")
+    return command + list(action)
+
+
+def load_ini(path):
+    config = configparser.RawConfigParser(inline_comment_prefixes=(";",))
+    with path.open(encoding="utf-8") as source:
+        config.read_file(source)
+    return config
+
+
+def expand_config(value, directory):
+    values = {"here": str(directory)}
+    values.update(("ENV_" + key, value) for key, value in os.environ.items())
+    try:
+        return value % values
+    except (KeyError, ValueError, TypeError) as error:
+        raise Sp2Error("无法展开配置中的路径：{}".format(value)) from error
+
+
+def locate_config(args):
+    if args.config:
+        return Path(args.config).expanduser().absolute()
+    executable = shutil.which(os.environ.get("SP2_SUPERVISORCTL", "supervisorctl"))
+    prefix = Path(executable).parent.parent if executable else Path(sys.prefix)
+    # Match supervisorctl's search order, including Homebrew's installation
+    # prefix rather than hard-coding Intel or Apple Silicon locations.
+    candidates = [prefix / "etc/supervisord.conf", prefix / "supervisord.conf",
+                  Path.cwd() / "supervisord.conf", Path.cwd() / "etc/supervisord.conf",
+                  Path("/etc/supervisord.conf"), Path("/etc/supervisor/supervisord.conf")]
+    return next((path.absolute() for path in candidates if path.is_file()), None)
+
+
+def connection_url(args):
+    config_path = locate_config(args)
+    endpoint = args.serverurl
+    if not endpoint and config_path:
+        try:
+            config = load_ini(Path(config_path))
+            endpoint = expand_config(config.get("supervisorctl", "serverurl"),
+                                     Path(config_path).parent)
+        except (OSError, configparser.Error, Sp2Error):
+            pass
+    return endpoint
+
+
+def instance_key(args):
+    # Use the endpoint when a readable config supplies it; otherwise
+    # isolate mappings by connection options rather than guessing a daemon.
+    config_path = locate_config(args)
+    endpoint = connection_url(args)
+    if endpoint and endpoint.startswith("unix://"):
+        endpoint = "unix://" + str(Path(endpoint[7:]).absolute())
+    identity = [endpoint] if endpoint else [str(config_path) if config_path else None,
+                                          str(Path.cwd()) if not config_path else None]
+    identity.append(shutil.which(os.environ.get("SP2_SUPERVISORCTL", "supervisorctl")))
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+
+@contextmanager
+def id_registry(args, create=True):
+    # Path.home respects the current user's home on both macOS and Ubuntu.
+    path = Path.home() / ".local" / "sp2" / "ids.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (path.parent / "ids.lock").open("a") as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+                "version": 1, "instances": {}}
+            if data.get("version") != 1 or not isinstance(data.get("instances"), dict):
+                raise ValueError("unsupported ID format")
+            for instance in data["instances"].values():
+                groups = instance["groups"]
+                next_id = instance["next_id"]
+                if (not isinstance(groups, dict) or type(next_id) is not int or next_id < 0
+                        or any(not isinstance(name, str) or type(value) is not int
+                               or not 0 <= value < next_id for name, value in groups.items())
+                        or len(set(groups.values())) != len(groups)):
+                    raise ValueError("invalid ID mapping")
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            raise Sp2Error("ID 文件无效，已保留原文件，请检查 {}".format(path)) from error
+        instance = data["instances"].setdefault(instance_key(args), {"next_id": 0, "groups": {}})
+        yield instance
+        if create:
+            staged = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                                 prefix=".ids-", delete=False) as output:
+                    staged = Path(output.name)
+                    json.dump(data, output, ensure_ascii=False, indent=2)
+                    output.write("\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(staged, path)
+            finally:
+                if staged and staged.exists():
+                    staged.unlink()
+
+
+def read_status(args):
+    result = subprocess.run(ctl_command(args, "status"), text=True, capture_output=True)
+    if result.returncode not in (0, 3):
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        raise Sp2Error("无法读取 Supervisor 状态（退出码 {}）".format(result.returncode))
+    groups = {}
+    for line in result.stdout.splitlines():
+        match = re.fullmatch(r"(\S+)\s+(STOPPED|STARTING|RUNNING|BACKOFF|STOPPING|EXITED|FATAL|UNKNOWN)\s*(.*)", line)
+        if not match:
+            raise Sp2Error("无法解析 Supervisor 状态：{}".format(line))
+        name, state, description = match.groups()
+        pid = re.search(r"\bpid (\d+)", description)
+        uptime = re.search(r"\buptime (.+)$", description)
+        groups.setdefault(name.split(":", 1)[0], []).append({
+            "name": name, "state": state, "pid": pid.group(1) if pid else "-",
+            "uptime": uptime.group(1) if uptime else "-"})
+    if result.returncode and not groups:
+        raise Sp2Error("Supervisor 未返回可用的进程状态")
+    return groups, result.returncode
+
+
+def print_table(rows):
+    def width(value):
+        return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in value)
+
+    rows = [[str(value) for value in row] for row in rows]
+    widths = [max(width(row[column]) for row in rows) for column in range(len(rows[0]))]
+
+    def border(left, middle, right):
+        print(left + middle.join("─" * (size + 2) for size in widths) + right)
+
+    border("┌", "┬", "┐")
+    for index, row in enumerate(rows):
+        print("│ " + " │ ".join(value + " " * (size - width(value))
+                                  for value, size in zip(row, widths)) + " │")
+        if index == 0:
+            border("├", "┼", "┤")
+    border("└", "┴", "┘")
+
+
+def group_memory(args, groups):
+    pids_by_group = {name: {process["pid"] for process in processes if process["pid"] != "-"}
+                     for name, processes in groups.items()}
+    memory = {name: "-" if pids else "0 B" for name, pids in pids_by_group.items()}
+    # A remote daemon's PIDs must never be looked up on this machine.
+    if not (connection_url(args) or "").startswith("unix://"):
+        return memory
+    pids = sorted(set().union(*pids_by_group.values()))
+    if not pids:
+        return memory
+    command = (["sudo"] if args.sudo else []) + ["ps", "-o", "pid=,rss=", "-p", ",".join(pids)]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=5,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return memory
+    if result.returncode not in (0, 1):
+        return memory
+    rss = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdecimal() for field in fields):
+            rss[fields[0]] = int(fields[1]) * 1024  # ps reports RSS in KiB on macOS and Ubuntu.
+    for name, pids in pids_by_group.items():
+        if pids and pids.issubset(rss):
+            size = sum(rss[pid] for pid in pids)
+            if size == 0:
+                memory[name] = "0 B"
+                continue
+            for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+                if size < 1024 or unit == "TiB":
+                    memory[name] = "{:.1f} {}".format(size, unit)
+                    break
+                size /= 1024
+    return memory
+
+
+def list_groups(args):
+    groups, code = read_status(args)
+    memory = group_memory(args, groups)
+    with id_registry(args) as registry:
+        for name in sorted(groups):
+            if name not in registry["groups"]:
+                registry["groups"][name] = registry["next_id"]
+                registry["next_id"] += 1
+        rows = [["id", "name", "status", "processes", "pid", "memory", "uptime"]]
+        for name in sorted(groups, key=lambda name: registry["groups"][name]):
+            processes = groups[name]
+            states = sorted({process["state"] for process in processes})
+            rows.append([registry["groups"][name], name, "/".join(states), len(processes),
+                         ",".join(process["pid"] for process in processes),
+                         memory[name],
+                         processes[0]["uptime"] if len(processes) == 1 else "-"])
+    print_table(rows)
+    return code
+
+
+def resolve_delete_targets(arguments, groups, registry):
+    targets = []
+    ids = {str(value): name for name, value in registry["groups"].items()}
+    for argument in arguments:
+        if argument.startswith("name:"):
+            name = argument[5:]
+        elif argument.isdecimal():
+            name = ids.get(str(int(argument)))
+            if name is None:
+                raise Sp2Error("未知 ID {}；请先用相同用户和连接选项执行 sp2 ls".format(argument))
+        else:
+            name = argument
+        if name not in groups:
+            raise Sp2Error("进程组不存在：{}；请使用 ls 中的 ID 或 name".format(name))
+        if name not in targets:
+            targets.append(name)
+    return targets
+
+
+def delete_plan(args, targets):
+    if "all" in targets:
+        raise Sp2Error("all 是 Supervisor update 的保留关键字，无法对同名组单独软删除")
+    main_path = Path(args.config).expanduser().absolute()
+    main = load_ini(main_path)
+    directory = main_path.parent
+    endpoint = expand_config(args.serverurl or main.get("supervisorctl", "serverurl", fallback=""), directory)
+    socket = expand_config(main.get("unix_http_server", "file", fallback=""), directory)
+    if (not endpoint.startswith("unix://") or not socket
+            or Path(endpoint[7:]).absolute() != Path(socket).absolute()):
+        raise Sp2Error("软删除仅支持主配置中对应的本机 Unix socket，不能修改远程 Supervisor 配置")
+    patterns = [str(directory / pattern) for pattern in
+                expand_config(main.get("include", "files", fallback=""), directory).split()]
+    paths = {main_path}
+    for pattern in patterns:
+        paths.update(Path(path).absolute() for path in glob.glob(pattern))
+    sections = {}
+    for path in sorted(paths):
+        config = main if path == main_path else load_ini(path)
+        for section in config.sections():
+            if section in sections:
+                raise Sp2Error("配置节重复，无法确定软删除范围：{}".format(section))
+            sections[section] = (path, config)
+    members = {}
+    grouped_programs = set()
+    for section, (_, config) in sections.items():
+        if section.startswith("group:"):
+            programs = [name.strip() for name in config.get(section, "programs").split(",")]
+            members[section[6:]] = {section} | {"program:" + name for name in programs}
+            grouped_programs.update(programs)
+    for section in sections:
+        kind, separator, name = section.partition(":")
+        if separator and kind in {"program", "eventlistener"} and name not in grouped_programs:
+            members.setdefault(name, set()).add(section)
+    wanted = set()
+    for name in targets:
+        if name not in members:
+            raise Sp2Error("主配置中找不到进程组 {}，请确认 -c 与运行中的 Supervisor 一致".format(name))
+        wanted.update(members[name])
+    if not wanted.issubset(sections):
+        raise Sp2Error("组配置引用了找不到的 program，无法安全软删除")
+    files = {sections[section][0] for section in wanted}
+    plans = []
+    for path in sorted(files):
+        unrelated = [section for section, (source, _) in sections.items()
+                     if source == path and section not in wanted]
+        if path == main_path or unrelated:
+            raise Sp2Error("{} 含有其他配置，请先将目标组拆分到独立配置文件".format(path))
+        if path.is_symlink() or not path.is_file():
+            raise Sp2Error("软删除配置必须是普通文件：{}".format(path))
+        destination = Path(str(path) + DISABLED_SUFFIX)
+        if any(fnmatch.fnmatch(str(destination), pattern) for pattern in patterns):
+            raise Sp2Error("include 规则仍会加载 {}；请先收窄为 *.conf 等规则".format(destination))
+        if destination.is_dir():
+            raise Sp2Error("禁用副本路径是目录：{}".format(destination))
+        if not args.sudo and not os.access(path.parent, os.W_OK | os.X_OK):
+            raise Sp2Error("无权修改配置目录 {}；请使用 --sudo 或有权限的用户".format(path.parent))
+        plans.append((path, destination))
+    return plans
+
+
+def move_config(args, source, destination):
+    if args.sudo:
+        result = subprocess.run(["sudo", "mv", "-f", "--", str(source), str(destination)])
+        if result.returncode:
+            raise Sp2Error("配置改名失败：{}".format(source))
+    else:
+        os.replace(source, destination)
+
+
+def delete_groups(args):
+    config_path = locate_config(args)
+    if config_path is None:
+        raise Sp2Error("未找到 Supervisor 主配置；请用 -c 路径或 SP2_CONFIG 指定自定义位置")
+    args.config = str(config_path)
+    groups, _ = read_status(args)
+    with id_registry(args, create=False) as registry:
+        targets = resolve_delete_targets(args.names, groups, registry)
+        plans = delete_plan(args, targets)
+        if args.dry_run:
+            for source, destination in plans:
+                command = (["sudo"] if args.sudo else []) + ["mv", "-f", "--", str(source), str(destination)]
+                print(shlex.join(command))
+            print(shlex.join(ctl_command(args, "update", *targets)))
+            return 0
+        moved = []
+        try:
+            for source, destination in plans:
+                move_config(args, source, destination)
+                moved.append((source, destination))
+                print("配置已禁用：{}".format(destination), flush=True)
+        except (OSError, Sp2Error, KeyboardInterrupt):
+            for source, destination in reversed(moved):
+                if not source.exists():
+                    move_config(args, destination, source)
+            raise
+        result = subprocess.run(ctl_command(args, "update", *targets))
+        if result.returncode:
+            raise Sp2Error("配置已加 .sp2.disabled 后缀，但应用失败；请检查以上输出，再执行 sp2 reload 目标组，或恢复配置")
+        remaining, _ = read_status(args)
+        if any(name in remaining for name in targets):
+            raise Sp2Error("配置已禁用，但部分组仍在运行时列表中，请检查 Supervisor 配置与服务是否对应")
+        print("已软删除：{}（同名 .sp2.disabled 副本会被覆盖）".format(", ".join(targets)))
+    return 0
+
+
 def main():
     cli = parser()
     args = cli.parse_args()
     if args.command in {None, "help"}:
         cli.print_help()
         return 0
+    if any(not name or any(char.isspace() for char in name) for name in getattr(args, "names", [])):
+        cli.error("命令参数不能为空或包含空白；进程和组名称请使用 Supervisor 标准名称")
+    try:
+        if args.command in DELETE_COMMANDS:
+            return delete_groups(args)
+        if args.command in LIST_COMMANDS and not args.names and not args.dry_run:
+            return list_groups(args)
+        return run_translated(args, cli)
+    except Sp2Error as error:
+        print("sp2: {}".format(error), file=sys.stderr)
+        return 1
+    except FileNotFoundError as error:
+        print("sp2: 找不到 {}；请检查路径或确认 Supervisor 已安装。".format(error.filename), file=sys.stderr)
+        return 127
+    except (OSError, configparser.Error) as error:
+        print("sp2: {}".format(error), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+def run_translated(args, cli):
     translated = translate(args, cli)
     # supervisorctl itself joins action arguments into a line before parsing it.
     # Reject whitespace rather than accidentally addressing a second process.
     if any(not arg or any(char.isspace() for char in arg) for arg in translated):
         cli.error("命令参数不能为空或包含空白；进程和组名称请使用 Supervisor 标准名称")
-    command = [os.environ.get("SP2_SUPERVISORCTL", "supervisorctl")]
-    if args.config:
-        command.extend(["-c", args.config])
-    if args.serverurl:
-        command.extend(["-s", args.serverurl])
-    command.extend(translated)
-    if args.sudo:
-        command.insert(0, "sudo")
+    command = ctl_command(args, *translated)
     if args.dry_run:
         print(shlex.join(command))
         return 0
-    try:
-        result = subprocess.run(command)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
-    except FileNotFoundError as error:
-        print("sp2: 找不到 {}；请安装 Supervisor 或检查 PATH。".format(error.filename), file=sys.stderr)
-        return 127
-    except OSError as error:
-        print("sp2: {}".format(error), file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
+    result = subprocess.run(command)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
 if __name__ == "__main__":
