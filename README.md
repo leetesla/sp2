@@ -174,16 +174,24 @@ Supervisor 按组移除，因此一行和一个 ID 对应整个进程组；同�
 
 ID 自动保存在当前用户的 `~/.local/sp2/ids.json`，macOS 与 Ubuntu 使用相同的相对主目录路径；例如 Linux root 用户为 `/root/.local/sp2/ids.json`。无需数据库或手动维护。不同 Supervisor 连接分别保存映射，同名组恢复后沿用原 ID，旧 ID 不会分配给其他名称；写入使用文件锁和原子替换。文件损坏时会报错并保留原文件。
 
-`sp2 --sudo` 仍使用当前用户的 ID 文件；`sudo sp2` 则使用 sudo 后用户的主目录。查看列表和按 ID 操作时，请使用同一用户及相同连接。`start/stop/restart` 和 `del/delete` 均支持表格 ID，也接受名称；纯数字组名用 `name:123`。
+`sp2 --sudo` 仍使用当前用户的 ID 文件；`sudo sp2` 则使用 sudo 后用户的主目录。查看列表和按 ID 操作时，请使用同一用户及相同连接。所有接收目标的常用命令均支持表格 ID，也接受名称：`start/stop/restart`、`logs`、`status/describe/show/info`、`ls/list/ps 目标`、`pid`、`flush`、`sendSignal`、`reload/update` 和 `del/delete`。纯数字组名用 `name:123`；`ctl` 始终原样转交参数。
 
 ```bash
 sp2 ls
 sp2 start 0
 sp2 stop 0
 sp2 restart 0 worker
+sp2 logs 0
+sp2 logs 0 --err --nostream
+sp2 pid 0
+sp2 describe 0
 ```
 
-ID 和组名操作作用于整个组，自动转为 Supervisor 的 `组:*`，因此支持 `cogvideo-worker:cogvideo-worker_00` 这样的进程池。若只操作组内某一个进程，使用完整名称，例如 `sp2 restart cogvideo-worker:cogvideo-worker_00`。`all` 沿用原生的全部进程含义。`--dry-run start/stop/restart ID` 会读取现有 ID 和状态以打印转换结果，不分配新 ID，也不启停进程。未知或已移除的 ID 会在执行前报错。
+ID 对应整个组。启停操作自动转为 Supervisor 的 `组:*`；日志、PID 和清空日志操作会展开成组内实际的完整进程名，因此支持 `cogvideo-worker:cogvideo-worker_00` 这样的进程池。若只操作组内某一个进程，使用完整名称，例如 `sp2 restart cogvideo-worker:cogvideo-worker_00`。支持 `all` 的命令沿用其原生的全部进程含义。`--dry-run` 会按需读取 ID 和状态以打印计划，不分配新 ID，也不执行目标操作。未知 ID 会在执行前报错；已移除的 ID 需先恢复配置，再通过 `reload ID或组名` 重新加入。
+
+### 按 ID 或名称查看日志
+
+`sp2 logs 0` 自动定位该组内的实际进程。单进程组直接跟随日志；多进程组同时跟随全部进程的日志，每行标注 `[组:进程]`。Ctrl+C 只结束日志查看，不会停止应用。`--err` 查看 stderr，`--nostream` 按进程打印日志末尾后退出，`--bytes N` 在非流模式下指定每个进程读取的字节数。`sp2 logs 组名` 行为相同；查看某一个进程使用 `sp2 logs 组:进程`。日志命令不接受 `all` 或 `组:*`，查看整个组使用 ID 或组名即可。
 
 ### 按 ID 或名称软删除
 
@@ -221,19 +229,19 @@ sp2 ps
 | `ls`、`list`、`ps`（无目标） | `status`，按组显示表格并维护 ID |
 | `ls/list/ps/status [目标...]` | `status [目标...]`；`status` 始终使用原生输出 |
 | `del/delete ID或组名...` | 配置加 `.sp2.disabled` 后缀，再 `update 组名...` |
-| `describe/show/info 目标...` | `status 目标...` |
+| `describe/show/info ID或名称...` | ID、组名转为 `组:*`，再 `status 目标...` |
 | `start/stop/restart ID或名称...` | 同名命令；ID、组名转为 `组:*`，完整进程名和 `all` 原样传递 |
-| `pid [目标...]` | `pid 目标...`，省略目标时为 `pid all` |
-| `logs 进程` | `tail -f 进程 stdout` |
-| `logs 进程 --err` | `tail -f 进程 stderr` |
-| `logs 进程 --nostream [--bytes N]` | `tail [-N] 进程 stdout` |
-| `flush [目标...]` | `clear 目标...`，省略目标时为 `clear all` |
-| `reload/update [组名...]` | `update [组名...]` |
+| `pid [ID或名称...]` | 展开组内进程后 `pid 进程...`，省略目标时为 `pid all` |
+| `logs ID或名称` | 对实际进程执行 `tail -f 进程 stdout`；多进程合并显示 |
+| `logs ID或名称 --err` | 对实际进程执行 `tail -f 进程 stderr` |
+| `logs ID或名称 --nostream [--bytes N]` | 按进程执行 `tail [-N] 进程 stdout` |
+| `flush [ID或名称...]` | 展开组内进程后 `clear 进程...`，省略目标时为 `clear all` |
+| `reload/update [ID或组名...]` | ID 转为组名，再 `update [组名...]` |
 | `reread` | `reread` |
-| `sendSignal SIGUSR1 目标...` | `signal SIGUSR1 目标...` |
+| `sendSignal SIGUSR1 ID或名称...` | ID、组名转为 `组:*`，再 `signal SIGUSR1 目标...` |
 | `ctl 原生命令 参数...` | 原样转交 |
 
-`start/stop/restart` 和 `del/delete` 的纯数字目标按表格 ID 解释，数字组名使用 `name:名称`。其他命令继续使用 Supervisor 名称，数字参数也沿用原生命名语义。`logs` 只接受单个进程；支持原生目标的命令可使用 `组:进程`、带引号的 `'组:*'` 或 `all`。
+以上接收目标的命令均将纯数字目标解释为表格 ID，数字组名使用 `name:名称`。`ctl` 保留 Supervisor 原生语义，例如 `sp2 ctl status 123` 中的 `123` 仍是 Supervisor 名称。支持原生目标的命令可使用 `组:进程`、带引号的 `'组:*'` 或 `all`；`logs` 与 `del` 的目标范围见对应说明。
 
 ## 行为约定
 

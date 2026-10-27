@@ -9,13 +9,14 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import selectors
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from types import SimpleNamespace
 
 
@@ -65,6 +66,24 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(SP2_MODULE.group_memory(args, {"api": [{"pid": "100"}]}), {"api": "-"})
         sample.assert_not_called()
 
+    def test_id_for_group_named_all_never_expands_to_every_group(self):
+        groups = {"all": [{"name": "all"}]}
+        registry = {"groups": {"all": 4}}
+        for command, mode, expected in [("status", "lifecycle", ["all:*"]),
+                                         ("sendSignal", "lifecycle", ["all:*"]),
+                                         ("pid", "processes", ["all:all"]),
+                                         ("flush", "processes", ["all:all"]),
+                                         ("logs", "processes", ["all:all"])]:
+            args = SimpleNamespace(command=command)
+            with self.subTest(command=command), \
+                    patch.object(SP2_MODULE, "read_status", return_value=(groups, 0)), \
+                    patch.object(SP2_MODULE, "id_registry", return_value=nullcontext(registry)):
+                self.assertEqual(SP2_MODULE.resolve_command_targets(args, ["4"], mode), expected)
+        with patch.object(SP2_MODULE, "read_status", return_value=(groups, 0)), \
+                patch.object(SP2_MODULE, "id_registry", return_value=nullcontext(registry)):
+            with self.assertRaises(SP2_MODULE.Sp2Error):
+                SP2_MODULE.resolve_command_targets(SimpleNamespace(command="reload"), ["4"])
+
     def test_help_and_no_command_work_without_supervisor_or_sudo(self):
         env = {**os.environ, "PATH": "", "SP2_SUPERVISORCTL": "/missing/supervisorctl"}
         outputs = []
@@ -98,7 +117,8 @@ class TranslationTests(unittest.TestCase):
                                (("stop", "all"), ["stop", "all"]),
                                (("restart", "name:123"), ["restart", "123:*"]),
                                (("stop", "batch:batch_00"), ["stop", "batch:batch_00"]),
-                               (("sendSignal", "SIGUSR1", "api"), ["signal", "SIGUSR1", "api"])]:
+                               (("ctl", "status", "0"), ["status", "0"]),
+                               (("sendSignal", "SIGUSR1", "api"), ["signal", "SIGUSR1", "api:*"])]:
             with self.subTest(args=args):
                 result = self.run_sp2(*args)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -211,8 +231,92 @@ class SupervisorTests(unittest.TestCase):
         added = self.group_ids()
         self.assertGreater(added["aardvark"], max(original.values()))
         disabled.rename(api)
-        self.assert_ok("reload", "api")
+        self.assert_ok("reload", str(original["api"]))
         self.assertEqual(self.group_ids()["api"], original["api"])
+
+    def test_logs_id_resolves_single_process_with_a_different_process_name(self):
+        ids = self.group_ids()
+        config = self.root / "programs/worker.conf"
+        config.write_text(config.read_text() + "numprocs=1\nprocess_name=%(program_name)s_%(process_num)02d\n")
+        self.assert_ok("reload", "worker")
+        target = str(ids["worker"])
+        self.assertIn("stdout-before", self.assert_ok("logs", target, "--nostream"))
+        self.assertIn("stderr-ready", self.assert_ok("logs", target, "--err", "--nostream"))
+        preview = self.assert_ok("--dry-run", "logs", target)
+        self.assertEqual(shlex.split(preview)[-4:], ["tail", "-f", "worker:worker_00", "stdout"])
+        self.assertIn("stdout-before", self.assert_ok("logs", "worker", "--nostream"))
+
+    def test_logs_id_for_process_pool_shows_every_log_and_flush_clears_only_that_pool(self):
+        ids = self.group_ids()
+        target = str(ids["batch"])
+        output = self.assert_ok("logs", target, "--nostream")
+        self.assertIn("==> batch:batch_00 <==", output)
+        self.assertIn("==> batch:batch_01 <==", output)
+        self.assertEqual(output.count("stdout-before"), 2)
+        output = self.assert_ok("logs", target, "--err", "--nostream")
+        self.assertEqual(output.count("stderr-ready"), 2)
+        self.assert_ok("flush", target)
+        for number in ("00", "01"):
+            self.assertEqual((self.root / ("batch_" + number + ".out.log")).read_text(), "")
+            self.assertEqual((self.root / ("batch_" + number + ".err.log")).read_text(), "")
+        self.assertIn("stdout-before", (self.root / "api.out.log").read_text())
+
+    def test_streaming_logs_id_merges_process_pool_and_interrupt_preserves_apps(self):
+        ids = self.group_ids()
+        stream = subprocess.Popen([sys.executable, str(SP2), "logs", str(ids["batch"])], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        output = bytearray()
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(stream.stdout, selectors.EVENT_READ)
+                deadline = time.monotonic() + 7
+                while time.monotonic() < deadline and output.count(b"stdout-before") < 2:
+                    for key, _ in selector.select(timeout=0.1):
+                        data = os.read(key.fileobj.fileno(), 4096)
+                        if not data:
+                            self.fail("Log stream exited before both process logs arrived: " + output.decode())
+                        output.extend(data)
+            self.assertGreaterEqual(output.count(b"stdout-before"), 2, output.decode())
+            self.assertIn(b"[batch:batch_00]", output)
+            self.assertIn(b"[batch:batch_01]", output)
+            os.killpg(stream.pid, signal.SIGINT)
+            stream.communicate(timeout=6)
+            self.assertIn(stream.returncode, [130, -signal.SIGINT])
+            self.assertEqual(self.assert_ok("status", "batch:*").count("RUNNING"), 2)
+        finally:
+            if stream.poll() is None:
+                os.killpg(stream.pid, signal.SIGKILL)
+                stream.communicate(timeout=5)
+
+    def test_ids_work_for_status_aliases_pid_signal_and_config_update(self):
+        ids = self.group_ids()
+        target = str(ids["batch"])
+        for command in ("status", "describe", "show", "info", "ls", "list", "ps"):
+            with self.subTest(command=command):
+                self.assertEqual(self.assert_ok(command, target).count("RUNNING"), 2)
+        expected = [self.assert_ok("pid", name).strip() for name in ("batch:batch_00", "batch:batch_01")]
+        self.assertEqual(self.assert_ok("pid", target).splitlines(), expected)
+        self.assertEqual(self.assert_ok("pid", "batch:*").splitlines(), expected)
+        self.assertEqual(self.assert_ok("sendSignal", "SIGCONT", target).count("signalled"), 2)
+        api_pid = self.assert_ok("pid", "api").strip()
+        previous = self.assert_ok("pid", "worker").strip()
+        config = self.root / "programs/worker.conf"
+        config.write_text(config.read_text().replace('SP2_MARKER="before"', 'SP2_MARKER="after"'))
+        self.assert_ok("update", str(ids["worker"]))
+        self.assertNotEqual(self.assert_ok("pid", "worker").strip(), previous)
+        self.assertEqual(self.assert_ok("pid", "api").strip(), api_pid)
+
+    def test_unknown_ids_are_rejected_consistently_before_target_operations(self):
+        self.group_ids()
+        original_log = (self.root / "api.out.log").read_bytes()
+        for args in [("logs", "999999", "--nostream"), ("pid", "999999"),
+                     ("flush", "api", "999999"), ("status", "999999"),
+                     ("sendSignal", "SIGCONT", "999999"), ("reload", "999999")]:
+            with self.subTest(args=args):
+                result = self.run_sp2(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("未知 ID", result.stderr)
+        self.assertEqual((self.root / "api.out.log").read_bytes(), original_log)
 
     def test_start_stop_restart_by_id_control_every_process_in_the_group(self):
         ids = self.group_ids()
@@ -462,9 +566,10 @@ class SupervisorTests(unittest.TestCase):
         self.assert_ok("reload")
         self.group_ids()
         self.assert_ok("stop", "name:123")
-        self.assertIn("STOPPED", self.run_sp2("status", "123").stdout)
+        self.assertIn("STOPPED", self.run_sp2("status", "name:123").stdout)
         self.assert_ok("start", "name:123")
-        self.assertIn("RUNNING", self.assert_ok("status", "123"))
+        self.assertIn("RUNNING", self.assert_ok("status", "name:123"))
+        self.assertIn("stdout-before", self.assert_ok("logs", "name:123", "--nostream"))
         self.assert_ok("del", "name:123", "batch", "worker")
         self.assertEqual(self.group_ids(), {})
 

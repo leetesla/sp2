@@ -2,8 +2,9 @@
 """PM2-style commands and stable group IDs for an existing Supervisor."""
 
 import argparse
+import codecs
 import configparser
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import fcntl
 import fnmatch
 import glob
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -24,6 +26,10 @@ DISABLED_SUFFIX = ".sp2.disabled"
 LIST_COMMANDS = {"list", "ls", "ps"}
 DELETE_COMMANDS = {"del", "delete"}
 LIFECYCLE_COMMANDS = {"start", "stop", "restart"}
+GROUP_PROCESS_COMMANDS = LIFECYCLE_COMMANDS | LIST_COMMANDS | {
+    "status", "describe", "show", "info", "sendSignal"}
+TARGET_COMMANDS = LIST_COMMANDS | LIFECYCLE_COMMANDS | {
+    "status", "describe", "show", "info", "pid", "flush", "sendSignal", "reload", "update"}
 
 
 class Sp2Error(Exception):
@@ -46,24 +52,24 @@ def parser():
     commands.add_parser("help", help="显示命令使用帮助")
     status = commands.add_parser("list", aliases=["ls", "ps", "status"],
                                  help="ls/ps 以表格显示进程组与稳定 ID；status 显示原生状态")
-    status.add_argument("names", nargs="*", help="进程名、group:process、'group:*' 或 all")
+    status.add_argument("names", nargs="*", help="表格 ID、组名、group:process、'group:*' 或 all")
     delete = commands.add_parser("del", aliases=["delete"],
                                  help="按 ID 或组名软删除：配置加 .sp2.disabled 后缀，并停止、移除组")
     delete.add_argument("names", nargs="+", metavar="ID或组名",
                         help="ls/ps 中的组 ID 或组名；数字组名用 name:名称；自动查找 Supervisor 配置")
     describe = commands.add_parser("describe", aliases=["show", "info"], help="查看指定进程状态")
-    describe.add_argument("names", nargs="+")
+    describe.add_argument("names", nargs="+", help="表格 ID、组名或完整进程名")
     for name, help_text in [("start", "启动已注册进程"), ("stop", "停止进程"),
                             ("restart", "重启进程，不重新读取配置")]:
         action = commands.add_parser(name, help=help_text)
         action.add_argument("names", nargs="+", help="表格 ID、组名、group:process 或 all；数字组名用 name:名称")
     pid = commands.add_parser("pid", help="查看进程 PID；省略目标时查看全部子进程")
-    pid.add_argument("names", nargs="*")
+    pid.add_argument("names", nargs="*", help="表格 ID、组名、完整进程名或 all")
     flush = commands.add_parser("flush", help="清空指定或全部进程日志")
-    flush.add_argument("names", nargs="*")
+    flush.add_argument("names", nargs="*", help="表格 ID、组名、完整进程名或 all")
 
-    logs = commands.add_parser("logs", help="跟随单个进程日志，默认 stdout；Ctrl+C 结束查看")
-    logs.add_argument("name", help="单个 Supervisor 进程名（不支持 all 或 group:*）")
+    logs = commands.add_parser("logs", help="按 ID、组名或完整进程名查看日志；Ctrl+C 结束查看")
+    logs.add_argument("name", help="表格 ID、组名或 group:process；多进程组会合并显示日志")
     streams = logs.add_mutually_exclusive_group()
     streams.add_argument("--err", action="store_true", help="查看 stderr")
     streams.add_argument("--out", action="store_true", help="查看 stdout（默认）")
@@ -72,11 +78,11 @@ def parser():
 
     reload_cmd = commands.add_parser("reload", aliases=["update"],
                                      help="应用配置变更并重启受影响的组；不是零停机重载")
-    reload_cmd.add_argument("names", nargs="*", metavar="GROUP", help="Supervisor 组名；省略时更新全部")
+    reload_cmd.add_argument("names", nargs="*", metavar="ID或组名", help="表格 ID 或组名；省略时更新全部")
     commands.add_parser("reread", help="只检查配置变更，不应用或重启")
     signal_cmd = commands.add_parser("sendSignal", help="向目标进程发送信号")
     signal_cmd.add_argument("signal")
-    signal_cmd.add_argument("names", nargs="+")
+    signal_cmd.add_argument("names", nargs="+", help="表格 ID、组名、完整进程名或 all")
     native = commands.add_parser("ctl", help="直接调用原生 supervisorctl 命令")
     native.add_argument("arguments", nargs=argparse.REMAINDER)
     return cli
@@ -101,7 +107,7 @@ def translate(args, cli):
         return ["signal", args.signal, *args.names]
     if action == "logs":
         if args.name == "all" or args.name.endswith(":*"):
-            cli.error("logs 需要单个进程名；先用 sp2 ls 查看 group:process 名称")
+            cli.error("logs 请使用 ID、组名或完整进程名；不支持 all 或 group:*")
         if args.bytes is not None and (args.bytes <= 0 or not args.nostream):
             cli.error("--bytes 必须为正整数，并与 --nostream 一起使用")
         flags = [] if args.nostream else ["-f"]
@@ -332,30 +338,109 @@ def resolve_group_name(argument, registry):
     return name
 
 
-def resolve_lifecycle_targets(args):
-    resolved = {}
-    if any(name.isdecimal() for name in args.names):
-        groups, _ = read_status(args)
-        with id_registry(args, create=False) as registry:
-            for argument in args.names:
-                if argument.isdecimal():
-                    name = resolve_group_name(argument, registry)
-                    if name not in groups:
-                        raise Sp2Error("ID {} 对应的进程组 {} 已不在 Supervisor 中；请先恢复配置并 reload".format(
-                            argument, name))
-                    resolved[argument] = name + ":*"
+def resolve_command_targets(args, arguments, mode="groups"):
+    has_ids = any(argument.isdecimal() for argument in arguments)
+    needs_processes = mode == "processes" and any(
+        argument != "all" and (":" not in argument or argument.startswith("name:") or argument.endswith(":*"))
+        for argument in arguments)
+    groups = read_status(args)[0] if has_ids or needs_processes else {}
+    context = id_registry(args, create=False) if has_ids else nullcontext({"groups": {}})
     targets = []
-    for argument in args.names:
-        if argument in resolved:
-            target = resolved[argument]
-        elif argument == "all":
-            target = "all"
-        else:
-            name = resolve_group_name(argument, {"groups": {}})
-            target = name if ":" in name else name + ":*"
-        if target not in targets:
-            targets.append(target)
+    with context as registry:
+        for argument in arguments:
+            name = resolve_group_name(argument, registry)
+            is_id = argument.isdecimal()
+            if is_id and name not in groups and args.command not in {"reload", "update"}:
+                raise Sp2Error("ID {} 对应的进程组 {} 已不在 Supervisor 中；请先恢复配置并 reload".format(
+                    argument, name))
+            if argument == "all":
+                expanded = ["all"]
+            elif mode == "processes":
+                group = name[:-2] if name.endswith(":*") else name
+                expanded = [(process["name"] if ":" in process["name"] else group + ":" + process["name"])
+                            for process in groups[group]] if group in groups else [name]
+            elif mode == "lifecycle":
+                expanded = [name if ":" in name else name + ":*"]
+            elif name == "all" and (is_id or argument.startswith("name:")):
+                if args.command in {"reload", "update"}:
+                    raise Sp2Error("all 是 Supervisor update 的保留关键字，无法按 ID 单独更新同名组")
+                expanded = ["all:*"]
+            else:
+                expanded = [name]
+            for target in expanded:
+                if target not in targets:
+                    targets.append(target)
     return targets
+
+
+def log_command(args, name, cli):
+    options = argparse.Namespace(**vars(args))
+    options.name = name
+    return ctl_command(options, *translate(options, cli))
+
+
+def stream_group_logs(args, names, cli):
+    processes = []
+    code = 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            for name in names:
+                process = subprocess.Popen(log_command(args, name, cli), stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+                processes.append(process)
+                selector.register(process.stdout, selectors.EVENT_READ, {
+                    "process": process, "name": name, "line_start": True,
+                    "decoder": codecs.getincrementaldecoder(sys.stdout.encoding or "utf-8")(errors="replace")})
+            while selector.get_map():
+                for key, _ in selector.select(timeout=0.2):
+                    data = os.read(key.fileobj.fileno(), 4096)
+                    state = key.data
+                    output = state["decoder"].decode(data, final=not data)
+                    if output:
+                        for part in output.splitlines(keepends=True):
+                            if state["line_start"]:
+                                sys.stdout.write("[{}] ".format(state["name"]))
+                            sys.stdout.write(part)
+                            state["line_start"] = part.endswith("\n")
+                        sys.stdout.flush()
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        result = state["process"].wait(timeout=5)
+                        if result:
+                            code = result if result > 0 else 128 - result
+        return code
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
+
+def run_logs(args, cli):
+    translate(args, cli)  # Validate log flags before looking up IDs or contacting Supervisor.
+    names = resolve_command_targets(args, [args.name], mode="processes")
+    if args.dry_run:
+        for name in names:
+            print(shlex.join(log_command(args, name, cli)))
+        return 0
+    if len(names) == 1:
+        args.name = names[0]
+        return run_translated(args, cli)
+    if not args.nostream:
+        return stream_group_logs(args, names, cli)
+    code = 0
+    for name in names:
+        print("==> {} <==".format(name), flush=True)
+        result = subprocess.run(log_command(args, name, cli))
+        if result.returncode:
+            code = result.returncode if result.returncode > 0 else 128 - result.returncode
+    return code
 
 
 def resolve_delete_targets(arguments, groups, registry):
@@ -490,15 +575,20 @@ def main():
     if args.command in {None, "help"}:
         cli.print_help()
         return 0
-    if any(not name or any(char.isspace() for char in name) for name in getattr(args, "names", [])):
+    targets = [args.name] if args.command == "logs" else getattr(args, "names", [])
+    if any(not name or any(char.isspace() for char in name) for name in targets):
         cli.error("命令参数不能为空或包含空白；进程和组名称请使用 Supervisor 标准名称")
     try:
         if args.command in DELETE_COMMANDS:
             return delete_groups(args)
         if args.command in LIST_COMMANDS and not args.names and not args.dry_run:
             return list_groups(args)
-        if args.command in LIFECYCLE_COMMANDS:
-            args.names = resolve_lifecycle_targets(args)
+        if args.command == "logs":
+            return run_logs(args, cli)
+        if args.command in TARGET_COMMANDS:
+            mode = "lifecycle" if args.command in GROUP_PROCESS_COMMANDS else (
+                "processes" if args.command in {"pid", "flush"} else "groups")
+            args.names = resolve_command_targets(args, args.names, mode=mode)
         return run_translated(args, cli)
     except Sp2Error as error:
         print("sp2: {}".format(error), file=sys.stderr)
@@ -506,7 +596,7 @@ def main():
     except FileNotFoundError as error:
         print("sp2: 找不到 {}；请检查路径或确认 Supervisor 已安装。".format(error.filename), file=sys.stderr)
         return 127
-    except (OSError, configparser.Error) as error:
+    except (OSError, configparser.Error, subprocess.TimeoutExpired) as error:
         print("sp2: {}".format(error), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
