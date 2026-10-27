@@ -222,6 +222,56 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotIn("batch", self.group_ids())
         self.assertIn("worker", self.group_ids())
 
+    def test_delete_removes_stale_groups_whose_configs_are_gone(self):
+        ids = self.group_ids()
+        self.assert_ok("stop", "worker")
+        other_pid = self.assert_ok("pid", "batch:batch_00").strip()
+        (self.root / "programs/worker.conf").unlink()
+        (self.root / "programs/api.conf").unlink()
+        preview = self.assert_ok("--dry-run", "del", str(ids["worker"]), "api")
+        self.assertIn("当前 include 中已无配置", preview)
+        self.assertIn("update worker api", preview)
+        self.assertIn("STOPPED", self.run_sp2("status", "worker").stdout)
+        self.assertIn("RUNNING", self.assert_ok("status", "api"))
+        self.assert_ok("del", str(ids["worker"]))
+        self.assertIn("RUNNING", self.assert_ok("status", "api"))
+        self.assertEqual(set(self.group_ids()), {"api", "batch"})
+        self.assert_ok("del", "api")
+        self.assertEqual(set(self.group_ids()), {"batch"})
+        self.assertEqual(self.assert_ok("pid", "batch:batch_00").strip(), other_pid)
+
+    def test_missing_client_definition_does_not_claim_still_configured_group_was_deleted(self):
+        client = self.root / "client.conf"
+        client.write_text(self.config.read_text().split("[include]")[0])
+        source = self.root / "programs/worker.conf"
+        pid = self.assert_ok("pid", "worker").strip()
+        result = self.run_sp2("-c", str(client), "del", "worker")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("仍在 Supervisor 中注册", result.stderr)
+        self.assertIn(str(client), result.stderr)
+        self.assertTrue(source.exists())
+        self.assertEqual(self.assert_ok("pid", "worker").strip(), pid)
+
+    def test_delete_handles_disabled_config_and_active_config_together(self):
+        ids = self.group_ids()
+        source = self.root / "programs/api.conf"
+        disabled = Path(str(source) + ".sp2.disabled")
+        source.rename(disabled)
+        expected = disabled.read_bytes()
+        self.assert_ok("del", str(ids["api"]), "worker")
+        self.assertEqual(disabled.read_bytes(), expected)
+        self.assertTrue((source.parent / "worker.conf.sp2.disabled").is_file())
+        self.assertEqual(set(self.group_ids()), {"batch"})
+
+    def test_stale_cleanup_failure_does_not_claim_config_was_renamed(self):
+        (self.root / "programs/api.conf").unlink()
+        (self.root / "programs/invalid.conf").write_text("[program:invalid]\n")
+        result = self.run_sp2("del", "api")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("按组更新失败", result.stderr)
+        self.assertNotIn("配置已加", result.stderr)
+        self.assertIn("RUNNING", self.assert_ok("status", "api"))
+
     def test_delete_preflights_all_targets_and_shared_config(self):
         self.group_ids()
         result = self.run_sp2("del", "api", "999999")

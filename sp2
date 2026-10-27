@@ -371,9 +371,11 @@ def delete_plan(args, targets):
         if separator and kind in {"program", "eventlistener"} and name not in grouped_programs:
             members.setdefault(name, set()).add(section)
     wanted = set()
+    missing = []
     for name in targets:
         if name not in members:
-            raise Sp2Error("主配置中找不到进程组 {}，请确认 -c 与运行中的 Supervisor 一致".format(name))
+            missing.append(name)
+            continue
         wanted.update(members[name])
     if not wanted.issubset(sections):
         raise Sp2Error("组配置引用了找不到的 program，无法安全软删除")
@@ -394,7 +396,7 @@ def delete_plan(args, targets):
         if not args.sudo and not os.access(path.parent, os.W_OK | os.X_OK):
             raise Sp2Error("无权修改配置目录 {}；请使用 --sudo 或有权限的用户".format(path.parent))
         plans.append((path, destination))
-    return plans
+    return plans, missing
 
 
 def move_config(args, source, destination):
@@ -414,7 +416,10 @@ def delete_groups(args):
     groups, _ = read_status(args)
     with id_registry(args, create=False) as registry:
         targets = resolve_delete_targets(args.names, groups, registry)
-        plans = delete_plan(args, targets)
+        plans, missing = delete_plan(args, targets)
+        if missing:
+            print("当前 include 中已无配置：{}；将由 Supervisor 按组更新并清理残留注册".format(", ".join(missing)),
+                  flush=True)
         if args.dry_run:
             for source, destination in plans:
                 command = (["sudo"] if args.sudo else []) + ["mv", "-f", "--", str(source), str(destination)]
@@ -434,10 +439,14 @@ def delete_groups(args):
             raise
         result = subprocess.run(ctl_command(args, "update", *targets))
         if result.returncode:
-            raise Sp2Error("配置已加 .sp2.disabled 后缀，但应用失败；请检查以上输出，再执行 sp2 reload 目标组，或恢复配置")
+            if moved:
+                raise Sp2Error("配置已加 .sp2.disabled 后缀，但应用失败；请检查以上输出，再执行 sp2 reload 目标组，或恢复配置")
+            raise Sp2Error("Supervisor 按组更新失败，尚未完成残留注册清理；请检查以上输出")
         remaining, _ = read_status(args)
-        if any(name in remaining for name in targets):
-            raise Sp2Error("配置已禁用，但部分组仍在运行时列表中，请检查 Supervisor 配置与服务是否对应")
+        unresolved = [name for name in targets if name in remaining]
+        if unresolved:
+            raise Sp2Error("组 {} 仍在 Supervisor 中注册；服务端可能仍有有效配置。客户端主配置为 {}，请核对服务实际加载的位置".format(
+                ", ".join(unresolved), args.config))
         print("已软删除：{}（同名 .sp2.disabled 副本会被覆盖）".format(", ".join(targets)))
     return 0
 
