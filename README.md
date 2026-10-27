@@ -8,6 +8,17 @@
 
 Supervisor 是一个合适的替代选择，但 `supervisorctl` 命令较长，操作习惯也与 PM2 不同。于是有了 `sp2`：在 Supervisor 之上封装一层简短、接近 PM2 使用习惯的命令入口，让日常进程管理更顺手，也减少进程管理工具对 Node.js 的依赖。
 
+## 支持的系统
+
+目前支持以下系统：
+
+| 系统 | 依赖安装方式 |
+| --- | --- |
+| macOS | 使用 Homebrew 安装缺失的依赖 |
+| Ubuntu | 使用 apt 安装缺失的依赖 |
+
+运行需要 Python 3.8+ 和 Supervisor。其他 Linux 发行版和 Windows 暂不在支持范围内。
+
 ## 安装（macOS / Ubuntu）
 
 ### 1. 准备 Git 和包管理器
